@@ -604,7 +604,28 @@ app.post("/webhook/orders/create", async (req, res) => {
     }
   }
 });
- 
+ app.get("/debug-shopify-scopes", async (_req, res) => {
+  try {
+    const data = await shopifyFetch(`${shopBaseUrl}/admin/oauth/access_scopes.json`, {
+      method: "GET",
+    });
+
+    console.log("SHOPIFY ACCESS SCOPES", data);
+
+    res.status(200).json({
+      ok: true,
+      shop: SHOP,
+      scopes: data.access_scopes,
+    });
+  } catch (err) {
+    console.error("❌ Could not fetch Shopify access scopes:", err);
+
+    res.status(500).json({
+      ok: false,
+      error: err.message,
+    });
+  }
+});
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
