@@ -1,24 +1,27 @@
 import express from "express";
 import fetch from "node-fetch";
 import { getShopifyToken } from "./getShopifyToken.js";
- 
+
 const app = express();
 app.use(express.json());
- 
+
 const PORT = process.env.PORT || 3000;
 const SHOP = process.env.SHOP;
 const API_VERSION = process.env.API_VERSION || "2026-04";
+
+const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID || process.env.SHOPIFY_API_KEY;
+const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET || process.env.SHOPIFY_API_SECRET;
+
+if (!SHOP || !CLIENT_ID || !CLIENT_SECRET) {
+  throw new Error("Missing required env vars: SHOP, SHOPIFY_CLIENT_ID, and SHOPIFY_CLIENT_SECRET/SHOPIFY_API_SECRET");
+}
+
+const shopBaseUrl = `https://${SHOP.replace(/^https?:\/\//, "").replace(/\/$/, "")}`;
  
 // ============================================================
 // 🧠 Local In-Memory Lock (Prevents Race Conditions)
 // ============================================================
 const localLocks = new Map();
- 
-if (!SHOP) {
-  console.error("❌ Missing required env var: SHOP");
-}
- 
-const shopBaseUrl = `https://${SHOP}`;
  
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -43,7 +46,7 @@ function mergeTags(existingTags, tagsToAdd) {
 async function shopifyFetch(url, options = {}, retries = 5) {
   for (let attempt = 0; attempt <= retries; attempt++) {
     const token = await getShopifyToken();
- 
+
     const resp = await fetch(url, {
       ...options,
       headers: {
@@ -52,32 +55,32 @@ async function shopifyFetch(url, options = {}, retries = 5) {
         "X-Shopify-Access-Token": token,
       },
     });
- 
+
     const text = await resp.text();
     let data = null;
- 
+
     try {
       data = text ? JSON.parse(text) : null;
     } catch {
       data = text;
     }
- 
+
     if (resp.ok) {
       return data;
     }
- 
+
     const retryAfterHeader = resp.headers.get("retry-after");
     const retryAfterMs = retryAfterHeader
       ? Number(retryAfterHeader) * 1000
       : null;
- 
+
     const shouldRetry =
       resp.status === 429 ||
       resp.status === 500 ||
       resp.status === 502 ||
       resp.status === 503 ||
       resp.status === 504;
- 
+
     console.error("❌ Shopify API request failed:", {
       url,
       status: resp.status,
@@ -86,16 +89,16 @@ async function shopifyFetch(url, options = {}, retries = 5) {
       retries,
       response: data,
     });
- 
+
     if (!shouldRetry || attempt === retries) {
       throw new Error(`Shopify API failed with status ${resp.status}: ${JSON.stringify(data)}`);
     }
- 
+
     const waitMs = retryAfterMs || 1000 * (attempt + 1);
     console.log(`⏳ Retrying Shopify request in ${waitMs}ms...`);
     await sleep(waitMs);
   }
- 
+
   throw new Error("Shopify API request failed unexpectedly");
 }
  
@@ -112,12 +115,11 @@ app.get("/", (_req, res) => {
   res.status(200).send("OK");
 });
  
-// Fetch parent pickup location
 async function getParentPickupLocation(orderId) {
   const data = await shopifyFetch(`${shopBaseUrl}/admin/api/${API_VERSION}/orders/${orderId}/fulfillment_orders.json`, {
     method: "GET",
   });
- 
+
   const assignedLocationId = data?.fulfillment_orders?.[0]?.assigned_location_id || null;
   console.log(`📍 Parent assigned location: ${assignedLocationId}`);
   return assignedLocationId;
@@ -136,55 +138,90 @@ function getParentPickupDate(order) {
   return normalizeDate(pickupDateFromNotes || pickupDateFallback);
 }
  
-// Fetch latest parent order
 async function getParentOrder(orderId) {
-  const data = await shopifyFetch(`${shopBaseUrl}/admin/api/${API_VERSION}/orders/${orderId}.json`, {
+  try {
+    const data = await shopifyFetch(`${shopBaseUrl}/admin/api/${API_VERSION}/orders/${orderId}.json`, {
+      method: "GET",
+    });
+
+    return data?.order || null;
+  } catch (err) {
+    console.error("❌ Error fetching parent order:", {
+      orderId,
+      error: err.message,
+    });
+
+    return null;
+  }
+}
+
+async function getOrderMetafield(orderId, namespace, key) {
+  const data = await shopifyFetch(`${shopBaseUrl}/admin/api/${API_VERSION}/orders/${orderId}/metafields.json`, {
     method: "GET",
   });
- 
-  return data.order;
+
+  return Array.isArray(data?.metafields)
+    ? data.metafields.find(m => m.namespace === namespace && m.key === key) || null
+    : null;
 }
- 
+
+async function upsertOrderMetafield(orderId, { namespace, key, type, value }) {
+  const existing = await getOrderMetafield(orderId, namespace, key);
+
+  if (existing?.id) {
+    return shopifyFetch(`${shopBaseUrl}/admin/api/${API_VERSION}/orders/${orderId}/metafields/${existing.id}.json`, {
+      method: "PUT",
+      body: JSON.stringify({
+        metafield: {
+          id: existing.id,
+          value: String(value ?? ""),
+          type,
+        },
+      }),
+    });
+  }
+
+  return shopifyFetch(`${shopBaseUrl}/admin/api/${API_VERSION}/orders/${orderId}/metafields.json`, {
+    method: "POST",
+    body: JSON.stringify({
+      metafield: {
+        namespace,
+        key,
+        type,
+        value: String(value ?? ""),
+      },
+    }),
+  });
+}
+
 // ============================================================
 // 🔒 Metafield Lock Helpers (custom.processing_lock)
 // ============================================================
  
 async function getProcessingLock(orderId) {
   try {
-    const data = await shopifyFetch(`${shopBaseUrl}/admin/api/${API_VERSION}/orders/${orderId}/metafields.json`, {
-      method: "GET",
-    });
- 
-    const lockField = Array.isArray(data?.metafields)
-      ? data.metafields.find(m => m.namespace === "custom" && m.key === "processing_lock")
-      : null;
- 
+    const lockField = await getOrderMetafield(orderId, "custom", "processing_lock");
     return lockField?.value || null;
   } catch (err) {
     console.error("❌ Error fetching processing lock:", err);
     return null;
   }
 }
- 
+
 async function setProcessingLock(orderId, value) {
   try {
-    await shopifyFetch(`${shopBaseUrl}/admin/api/${API_VERSION}/metafields.json`, {
-      method: "POST",
-      body: JSON.stringify({
-        metafield: {
-          namespace: "custom",
-          key: "processing_lock",
-          type: "single_line_text_field",
-          value,
-          owner_id: orderId,
-          owner_resource: "order",
-        },
-      }),
+    await upsertOrderMetafield(orderId, {
+      namespace: "custom",
+      key: "processing_lock",
+      type: "single_line_text_field",
+      value,
     });
- 
+
     console.log(`🔒 Lock for order ${orderId} set to: ${value}`);
+    return true;
   } catch (err) {
     console.error("❌ Error setting processing lock:", err);
+    return false;
   }
 }
  
@@ -240,7 +277,28 @@ app.post("/webhook/orders/create", async (req, res) => {
       console.log(`↩️ Child order ${order.id} detected at webhook entry. Skipping.`);
       return res.status(200).send("Child order skipped");
     }
- 
+
+// ✅ Confirm the parent order exists before writing locks/metafields
+const latestParent = await getParentOrder(order.id);
+
+if (!latestParent?.id) {
+  console.error("❌ Parent order could not be fetched from Shopify. If this was Shopify's Send test button, create a real test order instead.", {
+    orderId: order.id,
+    orderName: order.name,
+    topic: req.get("x-shopify-topic"),
+    webhookId: req.get("x-shopify-webhook-id"),
+  });
+
+  return res.status(200).send("Webhook received; parent order not found");
+}
+
+const latestParentTags = latestParent.tags || order.tags || "";
+if (latestParentTags.includes("Split-Processed") || latestParentTags.includes("Truckload-Ready")) {
+  console.log("↩️ Parent already marked as processed. Skipping split.");
+  return res.status(200).send("Already processed");
+}
+   
+   
     // 2. If the parent split is already in progress, skip ALL webhooks except the parent itself.
     const lockState = await getProcessingLock(order.id);
     if (lockState === "in_progress" && !tagsArray.some(t => t.startsWith("Parent-#"))) {
@@ -260,8 +318,14 @@ app.post("/webhook/orders/create", async (req, res) => {
     }
  
     // 2. Set lock to in_progress BEFORE any splitting logic
-    await setProcessingLock(order.id, "in_progress");
-    console.log(`🔒 Lock set to in_progress for parent ${order.id}`);
+const lockSet = await setProcessingLock(order.id, "in_progress");
+
+if (!lockSet) {
+  console.error(`❌ Could not set processing lock for ${order.id}. Stopping before split.`);
+  return res.status(500).send("Could not set processing lock");
+}
+
+console.log(`🔒 Lock set to in_progress for parent ${order.id}`);
  
     // 🚫 Skip child orders immediately
     if (tagsArray.includes("Split-Child")) {
@@ -269,14 +333,6 @@ app.post("/webhook/orders/create", async (req, res) => {
       return res.status(200).send("Child order skipped");
     }
  
-    // ✅ Double-check parent order tags from Shopify before splitting
-    const latestParent = await getParentOrder(order.id);
-    const latestParentTags = latestParent?.tags || order.tags || "";
- 
-    if (latestParentTags.includes("Split-Processed") || latestParentTags.includes("Truckload-Ready")) {
-      console.log("↩️ Parent already marked as processed. Skipping split.");
-      return res.status(200).send("Already processed");
-    }
  
     // 🏷️ Tag parent immediately to prevent duplicate splits
     const parentTagsWithProcessed = mergeTags(latestParentTags, ["Split-Processed"]);
@@ -430,13 +486,13 @@ app.post("/webhook/orders/create", async (req, res) => {
             billing_address: order.billing_address ?? undefined,
             email: order.email ?? undefined,
             note: childNote || null,
-            tags: [
-              "Split-Child",
-              `Truckload ${i + 1}`,
-              `Parent-${order.name}`,
-              `Product-${item.product_id}`,
-              `LineItem-${item.id}`,
-            ],
+tags: [
+  "Split-Child",
+  `Truckload ${i + 1}`,
+  `Parent-${order.name}`,
+  `Product-${item.product_id}`,
+  `LineItem-${item.id}`,
+].join(", "),
             purchase_order_number: projectName,
             metafields: [],
             fulfillment_status: "unfulfilled",
@@ -467,42 +523,26 @@ app.post("/webhook/orders/create", async (req, res) => {
  
         childOrdersCreated = true;
  
-        // Attach project name metafield
-        if (projectName) {
-          await shopifyFetch(`${shopBaseUrl}/admin/api/${API_VERSION}/metafields.json`, {
-            method: "POST",
-            body: JSON.stringify({
-              metafield: {
-                namespace: "custom",
-                key: "project_name",
-                type: "single_line_text_field",
-                value: projectName,
-                owner_id: createdOrder.order.id,
-                owner_resource: "order",
-              },
-            }),
-          });
-        }
+// Attach project name metafield to child order
+if (projectName) {
+  await upsertOrderMetafield(createdOrder.order.id, {
+    namespace: "custom",
+    key: "project_name",
+    type: "single_line_text_field",
+    value: projectName,
+  });
+}
  
         // Attach pickup date metafield
         const effectivePickupDate = pickupDateNormalized || parentPickupDate;
- 
-        if (effectivePickupDate) {
-          await shopifyFetch(`${shopBaseUrl}/admin/api/${API_VERSION}/metafields.json`, {
-            method: "POST",
-            body: JSON.stringify({
-              metafield: {
-                namespace: "custom",
-                key: "pickup_date",
-                type: "date",
-                value: effectivePickupDate,
-                owner_id: createdOrder.order.id,
-                owner_resource: "order",
-              },
-            }),
-          });
-        }
- 
+ if (effectivePickupDate) {
+  await upsertOrderMetafield(createdOrder.order.id, {
+    namespace: "custom",
+    key: "pickup_date",
+    type: "date",
+    value: effectivePickupDate,
+  });
+}
         await sleep(500);
       }
     }
@@ -521,41 +561,27 @@ app.post("/webhook/orders/create", async (req, res) => {
  
     const parentProjectName = projectNameFromNotes || projectNameFallback;
  
-    if (parentProjectName) {
-      await shopifyFetch(`${shopBaseUrl}/admin/api/${API_VERSION}/metafields.json`, {
-        method: "POST",
-        body: JSON.stringify({
-          metafield: {
-            namespace: "custom",
-            key: "project_name",
-            type: "single_line_text_field",
-            value: parentProjectName,
-            owner_id: order.id,
-            owner_resource: "order",
-          },
-        }),
-      });
-    }
+if (parentProjectName) {
+  await upsertOrderMetafield(order.id, {
+    namespace: "custom",
+    key: "project_name",
+    type: "single_line_text_field",
+    value: parentProjectName,
+  });
+}
  
     // ============================================================
     // 📅 Parent pickup date metafield
     // ============================================================
  
-    if (parentPickupDate) {
-      await shopifyFetch(`${shopBaseUrl}/admin/api/${API_VERSION}/metafields.json`, {
-        method: "POST",
-        body: JSON.stringify({
-          metafield: {
-            namespace: "custom",
-            key: "pickup_date",
-            type: "date",
-            value: parentPickupDate,
-            owner_id: order.id,
-            owner_resource: "order",
-          },
-        }),
-      });
-    }
+if (parentPickupDate) {
+  await upsertOrderMetafield(order.id, {
+    namespace: "custom",
+    key: "pickup_date",
+    type: "date",
+    value: parentPickupDate,
+  });
+}
  
     // ============================================================
     // 🔒 FINAL LOCK COMPLETION — mark as done only after all loops finish
@@ -587,12 +613,15 @@ app.post("/webhook/orders/create", async (req, res) => {
     res.status(200).send("Split processed");
   } catch (err) {
     console.error("❌ Error processing split:", err);
- 
+
     if (order?.id) {
-      await setProcessingLock(order.id, "failed");
-      console.log(`🔒 Lock for order ${order.id} set to failed`);
+      const failedLockSet = await setProcessingLock(order.id, "failed");
+
+      if (failedLockSet) {
+        console.log(`🔒 Lock for order ${order.id} set to failed`);
+      }
     }
- 
+
     res.status(500).send("Error");
   } finally {
     // ============================================================
@@ -604,6 +633,26 @@ app.post("/webhook/orders/create", async (req, res) => {
     }
   }
 });
+
+app.get("/debug-token", async (_req, res) => {
+  try {
+    const token = await getShopifyToken();
+
+    res.status(200).json({
+      ok: true,
+      tokenGenerated: Boolean(token),
+      tokenLength: token.length,
+    });
+  } catch (err) {
+    console.error("❌ Debug token failed:", err);
+
+    res.status(500).json({
+      ok: false,
+      error: err.message,
+    });
+  }
+});
+
  app.get("/debug-shopify-scopes", async (_req, res) => {
   try {
     const data = await shopifyFetch(`${shopBaseUrl}/admin/oauth/access_scopes.json`, {
@@ -626,6 +675,8 @@ app.post("/webhook/orders/create", async (req, res) => {
     });
   }
 });
+
+
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
